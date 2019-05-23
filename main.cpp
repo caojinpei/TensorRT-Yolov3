@@ -12,13 +12,45 @@ using namespace argsParser;
 using namespace Tn;
 using namespace Yolo;
 
+
+string onnxFile = "./ped3_608_1.onnx";
+string engineFile = "./ped3_608_1.trt";
+string fileList = "./list.txt";
+
+vector<string> labels = { "people"};
+vector<vector<int> > output_shape = { {1, 18, 19, 19}, {1, 18, 38, 38} };
+vector<vector<int> > g_masks = { {3, 4, 5}, {0, 1, 2} };
+vector<vector<int> > g_anchors = { {8, 34}, {14, 60}, {23, 94}, {39, 149}, {87,291}, {187,472} };
+float obj_threshold = 0.10;
+float nms_threshold = 0.45;
+
+int CATEGORY = 1;
+int BATCH_SIZE = 1;
+//int INPUT_CHANNEL = 3;
+int DETECT_WIDTH = 608;
+int DETECT_HEIGHT = 608;
+
+
+// Res struct & function
+typedef struct DetectionRes {
+	float x, y, w, h, prob;
+} DetectionRes;
+
+float sigmoid(float in) {
+	return 1.f / (1.f + exp(-in));
+}
+float exponential(float in) {
+	return exp(in);
+}
+
+
 vector<float> prepareImage(cv::Mat& img)
 {
     using namespace cv;
 
-    int c = parser::getIntValue("C");
-    int h = parser::getIntValue("H");   //net h
-    int w = parser::getIntValue("W");   //net w
+    int c = 3;
+    int h = 608;   //net h
+    int w = 608;   //net w
 
     float scale = min(float(w)/img.cols,float(h)/img.rows);
     auto scaleSize = cv::Size(img.cols * scale,img.rows * scale);
@@ -53,112 +85,152 @@ vector<float> prepareImage(cv::Mat& img)
     return result;
 }
 
-void DoNms(vector<Detection>& detections,int classes ,float nmsThresh)
-{
-    auto t_start = chrono::high_resolution_clock::now();
+void DoNms(vector<DetectionRes>& detections, float nmsThresh) {
+	auto iouCompute = [](float * lbox, float* rbox) {
+		float interBox[] = {
+			max(lbox[0], rbox[0]), //left
+			min(lbox[0] + lbox[2], rbox[0] + rbox[2]), //right
+			max(lbox[1], rbox[1]), //top
+			min(lbox[1] + lbox[3], rbox[1] + rbox[3]), //bottom
+		};
 
-    vector<vector<Detection>> resClass;
-    resClass.resize(classes);
+		if (interBox[2] >= interBox[3] || interBox[0] >= interBox[1])
+			return 0.0f;
 
-    for (const auto& item : detections)
-        resClass[item.classId].push_back(item);
+		float interBoxS = (interBox[1] - interBox[0] + 1) * (interBox[3] - interBox[2] + 1);
+		return interBoxS / (lbox[2] * lbox[3] + rbox[2] * rbox[3] - interBoxS);
+	};
 
-    auto iouCompute = [](float * lbox, float* rbox)
-    {
-        float interBox[] = {
-            max(lbox[0] - lbox[2]/2.f , rbox[0] - rbox[2]/2.f), //left
-            min(lbox[0] + lbox[2]/2.f , rbox[0] + rbox[2]/2.f), //right
-            max(lbox[1] - lbox[3]/2.f , rbox[1] - rbox[3]/2.f), //top
-            min(lbox[1] + lbox[3]/2.f , rbox[1] + rbox[3]/2.f), //bottom
-        };
-        
-        if(interBox[2] > interBox[3] || interBox[0] > interBox[1])
-            return 0.0f;
+	sort(detections.begin(), detections.end(), [=](const DetectionRes & left, const DetectionRes & right) {
+		return left.prob > right.prob;
+	});
 
-        float interBoxS =(interBox[1]-interBox[0])*(interBox[3]-interBox[2]);
-        return interBoxS/(lbox[2]*lbox[3] + rbox[2]*rbox[3] -interBoxS);
-    };
-
-    vector<Detection> result;
-    for (int i = 0;i<classes;++i)
-    {
-        auto& dets =resClass[i]; 
-        if(dets.size() == 0)
-            continue;
-
-        sort(dets.begin(),dets.end(),[=](const Detection& left,const Detection& right){
-            return left.prob > right.prob;
-        });
-
-        for (unsigned int m = 0;m < dets.size() ; ++m)
-        {
-            auto& item = dets[m];
-            result.push_back(item);
-            for(unsigned int n = m + 1;n < dets.size() ; ++n)
-            {
-                if (iouCompute(item.bbox,dets[n].bbox) > nmsThresh)
-                {
-                    dets.erase(dets.begin()+n);
-                    --n;
-                }
-            }
-        }
-    }
-
-    //swap(detections,result);
-    detections = move(result);
-
-    auto t_end = chrono::high_resolution_clock::now();
-    float total = chrono::duration<float, milli>(t_end - t_start).count();
-    cout << "Time taken for nms is " << total << " ms." << endl;
+	vector<DetectionRes> result;
+	for (unsigned int m = 0; m < detections.size(); ++m) {
+		result.push_back(detections[m]);
+		for (unsigned int n = m + 1; n < detections.size(); ++n) {
+			if (iouCompute((float *)(&detections[m]), (float *)(&detections[n])) > nmsThresh) {
+				detections.erase(detections.begin() + n);
+				--n;
+			}
+		}
+	}
+	detections = move(result);
 }
 
 
-vector<Bbox> postProcessImg(cv::Mat& img,vector<Detection>& detections,int classes)
-{
-    using namespace cv;
+vector<DetectionRes> postProcess(cv::Mat& image, float * output) {
+	vector<DetectionRes> detections;
+	int total_size = 0;
+	for (int i = 0; i < output_shape.size(); i++) {
+		auto shape = output_shape[i];
+		int size = 1;
+		for (int j = 0; j < shape.size(); j++) {
+			size *= shape[j];
+		}
+		total_size += size;
+	}
 
-    int h = parser::getIntValue("H");   //net h
-    int w = parser::getIntValue("W");   //net w
+	int offset = 0;
+	float * transposed_output = new float[total_size];
+	float * transposed_output_t = transposed_output;
+	for (int i = 0; i < output_shape.size(); i++) {
+		auto shape = output_shape[i];  // nchw
+		int chw = shape[1] * shape[2] * shape[3];
+		int hw = shape[2] * shape[3];
+		for (int n = 0; n < shape[0]; n++) {
+			int offset_n = offset + n * chw;
+			for (int h = 0; h < shape[2]; h++) {
+				for (int w = 0; w < shape[3]; w++) {
+					int h_w = h * shape[3] + w;
+					for (int c = 0; c < shape[1]; c++) {
+						int offset_c = offset_n + hw * c + h_w;
+						*transposed_output_t++ = output[offset_c];
+					}
+				}
+			}
+		}
+		offset += shape[0] * chw;
+	}
+	vector<vector<int> > shapes;
+	for (int i = 0; i < output_shape.size(); i++) {
+		auto shape = output_shape[i];
+		vector<int> tmp = { shape[2], shape[3], 3, 6 };
+		shapes.push_back(tmp);
+	}
 
-    //scale bbox to img
-    int width = img.cols;
-    int height = img.rows;
-    float scale = min(float(w)/width,float(h)/height);
-    float scaleSize[] = {width * scale,height * scale};
+	offset = 0;
+	for (int i = 0; i < output_shape.size(); i++) {
+		auto masks = g_masks[i];
+		vector<vector<int> > anchors;
+		for (auto mask : masks)
+			anchors.push_back(g_anchors[mask]);
+		auto shape = shapes[i];
+		for (int h = 0; h < shape[0]; h++) {
+			int offset_h = offset + h * shape[1] * shape[2] * shape[3];
+			for (int w = 0; w < shape[1]; w++) {
+				int offset_w = offset_h + w * shape[2] * shape[3];
+				for (int c = 0; c < shape[2]; c++) {
+					int offset_c = offset_w + c * shape[3];
+					float * ptr = transposed_output + offset_c;
+					ptr[4] = sigmoid(ptr[4]);
+					ptr[5] = sigmoid(ptr[5]);
+					float score = ptr[4] * ptr[5];
+					if (score < obj_threshold)
+						continue;
+					ptr[0] = sigmoid(ptr[0]);
+					ptr[1] = sigmoid(ptr[1]);
+					ptr[2] = exponential(ptr[2]) * anchors[c][0];
+					ptr[3] = exponential(ptr[3]) * anchors[c][1];
 
-    //correct box
-    for (auto& item : detections)
-    {
-        auto& bbox = item.bbox;
-        bbox[0] = (bbox[0] * w - (w - scaleSize[0])/2.f) / scaleSize[0];
-        bbox[1] = (bbox[1] * h - (h - scaleSize[1])/2.f) / scaleSize[1];
-        bbox[2] /= scaleSize[0];
-        bbox[3] /= scaleSize[1];
-    }
-    
-    //nms
-    float nmsThresh = parser::getFloatValue("nms");
-    if(nmsThresh > 0) 
-        DoNms(detections,classes,nmsThresh);
+					ptr[0] += w;
+					ptr[1] += h;
+					ptr[0] /= shape[0];
+					ptr[1] /= shape[1];
+					ptr[2] /= DETECT_WIDTH;
+					ptr[3] /= DETECT_WIDTH;
+					ptr[0] -= ptr[2] / 2;
+					ptr[1] -= ptr[3] / 2;
 
-    vector<Bbox> boxes;
-    for(const auto& item : detections)
-    {
-        auto& b = item.bbox;
-        Bbox bbox = 
-        { 
-            item.classId,   //classId
-            max(int((b[0]-b[2]/2.)*width),0), //left
-            min(int((b[0]+b[2]/2.)*width),width), //right
-            max(int((b[1]-b[3]/2.)*height),0), //top
-            min(int((b[1]+b[3]/2.)*height),height), //bot
-            item.prob       //score
-        };
-        boxes.push_back(bbox);
-    }
+					DetectionRes det;;
+					det.x = ptr[0];
+					det.y = ptr[1];
+					det.w = ptr[2];
+					det.h = ptr[3];
+					det.prob = score;
+					detections.push_back(det);
+				}
+			}
+		}
+		offset += shape[0] * shape[1] * shape[2] * shape[3];
+	}
+	delete[]transposed_output;
 
-    return boxes;
+	int h = DETECT_WIDTH;   //net h
+	int w = DETECT_WIDTH;   //net w
+
+	//scale bbox to img
+	int width = image.cols;
+	int height = image.rows;
+	float scale = min(float(w) / width, float(h) / height);
+	float scaleSize[] = { width * scale, height * scale };
+
+	//correct box
+	for (auto& bbox : detections) {
+		bbox.x = (bbox.x * w - (w - scaleSize[0]) / 2.f) / scale;
+		bbox.y = (bbox.y * h - (h - scaleSize[1]) / 2.f) / scale;
+		bbox.w *= w;
+		bbox.h *= h;
+		bbox.w /= scale;
+		bbox.h /= scale;
+	}
+
+	//nms
+	float nmsThresh = nms_threshold;
+	if (nmsThresh > 0)
+		DoNms(detections, nmsThresh);
+
+	return detections;
 }
 
 vector<string> split(const string& str, char delim)
@@ -175,18 +247,12 @@ vector<string> split(const string& str, char delim)
 
 int main( int argc, char* argv[] )
 {
-    parser::ADD_ARG_STRING("prototxt",Desc("input yolov3 deploy"),DefaultValue(INPUT_PROTOTXT),ValueDesc("file"));
-    parser::ADD_ARG_STRING("caffemodel",Desc("input yolov3 caffemodel"),DefaultValue(INPUT_CAFFEMODEL),ValueDesc("file"));
+    parser::ADD_ARG_STRING("onnxmodel",Desc("input yolov3 caffemodel"),DefaultValue(INPUT_ONNXMODEL),ValueDesc("file"));
     parser::ADD_ARG_INT("C",Desc("channel"),DefaultValue(to_string(INPUT_CHANNEL)));
-    parser::ADD_ARG_INT("H",Desc("height"),DefaultValue(to_string(INPUT_HEIGHT)));
-    parser::ADD_ARG_INT("W",Desc("width"),DefaultValue(to_string(INPUT_WIDTH)));
-    parser::ADD_ARG_STRING("calib",Desc("calibration image List"),DefaultValue(CALIBRATION_LIST),ValueDesc("file"));
-    parser::ADD_ARG_STRING("mode",Desc("runtime mode"),DefaultValue(MODE), ValueDesc("fp32/fp16/int8"));
-    parser::ADD_ARG_STRING("outputs",Desc("output nodes name"),DefaultValue(OUTPUTS));
     parser::ADD_ARG_INT("class",Desc("num of classes"),DefaultValue(to_string(DETECT_CLASSES)));
     parser::ADD_ARG_FLOAT("nms",Desc("non-maximum suppression value"),DefaultValue(to_string(NMS_THRESH)));
     parser::ADD_ARG_INT("batchsize",Desc("batch size for input"),DefaultValue("1"));
-    parser::ADD_ARG_STRING("enginefile",Desc("load from engine"),DefaultValue(""));
+    parser::ADD_ARG_STRING("enginefile",Desc("load from engine"),DefaultValue(ENGINE_FILE),ValueDesc("file"));
 
     //input
     parser::ADD_ARG_STRING("input",Desc("input image file"),DefaultValue(INPUT_IMAGE),ValueDesc("file"));
@@ -210,52 +276,11 @@ int main( int argc, char* argv[] )
     }
     else
     {
-    string deployFile = parser::getStringValue("prototxt");
-    string caffemodelFile = parser::getStringValue("caffemodel");
+    string onnxmodelFile = parser::getStringValue("onnxmodel");
 
-    vector<vector<float>> calibData;
-    string calibFileList = parser::getStringValue("calib");
-    string mode = parser::getStringValue("mode");
-    if(calibFileList.length() > 0 && mode == "int8")
-    {   
-        cout << "find calibration file,loading ..." << endl;
-      
-        ifstream file(calibFileList);  
-        if(!file.is_open())
-        {
-            cout << "read file list error,please check file :" << calibFileList << endl;
-            exit(-1);
-        }
-
-        string strLine;  
-        while( getline(file,strLine) )                               
-        { 
-            cv::Mat img = cv::imread(strLine);
-            auto data = prepareImage(img);
-            calibData.emplace_back(data);
-        } 
-        file.close();
-    }
-
-    RUN_MODE run_mode = RUN_MODE::FLOAT32;
-    if(mode == "int8")
-    {
-        if(calibFileList.length() == 0)
-            cout << "run int8 please input calibration file, will run in fp32" << endl;
-        else
-            run_mode = RUN_MODE::INT8;
-    }
-    else if(mode == "fp16")
-    {
-        run_mode = RUN_MODE::FLOAT16;
-    }
-    
-    string outputNodes = parser::getStringValue("outputs");
-    auto outputNames = split(outputNodes,',');
-    
-        //save Engine name
-    string saveName = "yolov3_" + mode + ".engine";
-        net.reset(new trtNet(deployFile,caffemodelFile,outputNames,calibData,run_mode,batchSize));
+    //save Engine name
+    string saveName = "./ped.trt";
+        net.reset(new trtNet(onnxmodelFile,batchSize));
     cout << "save Engine..." << saveName <<endl;
         net->saveEngine(saveName);
     }
@@ -278,7 +303,7 @@ int main( int argc, char* argv[] )
         fileNames.push_back(inputFileName);
     }
 
-    list<vector<Bbox>> outputs;
+    list<vector<DetectionRes>> outputs;
     int classNum = parser::getIntValue("class");
     int c = parser::getIntValue("C");
     int h = parser::getIntValue("H");
@@ -296,6 +321,7 @@ int main( int argc, char* argv[] )
         std::cout << "process: " << filename << std::endl;
 
         cv::Mat img = cv::imread(filename);
+        std::cout << "process: " << filename << std::endl;
         vector<float> curInput = prepareImage(img);
         if (!curInput.data())
             continue;
@@ -314,49 +340,48 @@ int main( int argc, char* argv[] )
         auto outputSize = net->getOutputSize()/ sizeof(float) / batchCount;
         for(int i = 0;i< batchCount ; ++i)
         {    
-        //first detect count
-            int detCount = output[0];
-        //later detect result
-        vector<Detection> result;
-            result.resize(detCount);
-            memcpy(result.data(), &output[1], detCount*sizeof(Detection));
 
-            auto boxes = postProcessImg(inputImgs[i],result,classNum);
-        outputs.emplace_back(boxes);
+            auto boxes = postProcess(inputImgs[i],output);
+            outputs.emplace_back(boxes);
+
+        //print boxes
+            for (int i = 0; i < boxes.size(); ++i)
+            {
+                cout << boxes[i].prob << ", " << boxes[i].x << ", " << boxes[i].y << ", " << boxes[i].w << ", " << boxes[i].h << endl;
+	    }
+
+            cout << "\n" << endl;
 
             output += outputSize;
         }
-        inputImgs.clear();
+        //inputImgs.clear();
         inputData.clear();
 
         batchCount = 0;
     }
-    
-    
-    net->printTime();        
-
-    if(groundTruth.size() > 0)
+    // draw boxes
+    int idx = 1;
+    auto iterDet = outputs.begin();
+    for (unsigned int i = 0; i < fileNames.size(); ++i, ++iterDet)
     {
-        //eval map
-        evalMAPResult(outputs,groundTruth,classNum,0.5f);
-        evalMAPResult(outputs,groundTruth,classNum,0.75f);
+            const vector<DetectionRes> &outputI = *iterDet;
+            for (auto box : outputI)
+            {
+                int x = box.x,
+                    y = box.y,
+                    w = box.w,
+                    h = box.h;
+                cv::Rect rect = { x, y, w, h };
+                cv::rectangle(inputImgs[i], rect, cv::Scalar(255, 255, 0), 2);
+             }
+             stringstream ss;
+             ss << idx;
+             string index = ss.str();
+             idx++;
+             cv::imwrite("./result_" + index + ".jpg", inputImgs[i]);
+             cout << "save result to: " << "./result_" + index + ".jpg" << endl;
     }
-
-    if(fileNames.size() == 1)
-    {
-        //draw on image
-        cv::Mat img = cv::imread(*fileNames.begin());
-        auto bbox = *outputs.begin();
-        for(const auto& item : bbox)
-        {
-            cv::rectangle(img,cv::Point(item.left,item.top),cv::Point(item.right,item.bot),cv::Scalar(0,0,255),3,8,0);
-            cout << "class=" << item.classId << " prob=" << item.score*100 << endl;
-            cout << "left=" << item.left << " right=" << item.right << " top=" << item.top << " bot=" << item.bot << endl;
-        }
-        cv::imwrite("result.jpg",img);
-        cv::imshow("result",img);
-        cv::waitKey(0);
-    }
+       
 
     return 0;
 }
